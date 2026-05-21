@@ -79,6 +79,7 @@ on:
 permissions:
   contents: read
   id-token: write   # Vault OIDC
+  packages: read    # private @runtools-ai npm scope (db-schema, etc.)
 
 jobs:
   smoke:
@@ -119,6 +120,13 @@ jobs:
             ${{ inputs.extra_vault_secrets }}
 
       - name: Build PR code
+        env:
+          # Project .npmrc files in RunTools repos use `${GITHUB_TOKEN}` as
+          # the auth template for the @runtools-ai scope on npm.pkg.github.com.
+          # The default Actions GITHUB_TOKEN works because each calling repo
+          # is linked under the package's "Manage Actions access" settings,
+          # combined with our `packages: read` permission above.
+          GITHUB_TOKEN: ${{ github.token }}
         run: ${{ inputs.build_command }}
 
       - name: Start service on localhost:${{ inputs.port }} (background)
