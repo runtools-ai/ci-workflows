@@ -1,0 +1,177 @@
+---
+# Reusable PR-gate workflow for RunTools consumer-pattern repos.
+#
+# Pattern: no service to boot. Install deps, typecheck/lint/build/test,
+# optionally invoke the built artifact against the prod API surface
+# (api.runtools.ai et al.) with SMOKE_ORG_API_KEY from Vault.
+#
+# This is the sibling of `droplet-localhost-smoke.yml` for repos that
+# are libraries (SDK), CLIs, build-recipe projects, or apps with their
+# own packaging pipeline (Mac autopilot). Those repos don't run a
+# local HTTP server during CI — they just need to typecheck, build,
+# and prove the artifact works.
+#
+# Per-repo caller layout (.github/workflows/ci.yml):
+#
+#   jobs:
+#     smoke:
+#       uses: runtools-ai/ci-workflows/.github/workflows/consumer-prod-smoke.yml@main
+#       secrets: inherit
+#       with:
+#         service_name: sdk
+#         vault_role: sdk           # or "" to skip Vault entirely
+#         runtime: bun
+#         install_command: bun install --frozen-lockfile
+#         smoke_commands: |
+#           bun run typecheck
+#           bun run build
+#           bun test
+#
+# `smoke_commands` is the full body of work — each line is a separate
+# shell command that runs `set -e` style. Any command failure fails
+# the job. This keeps the reusable narrow: callers describe what they
+# want done in their own language without bolting more inputs onto
+# this workflow.
+
+name: Consumer prod smoke
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: Short name of the package (used in logs)
+        type: string
+        required: true
+      vault_role:
+        description: |
+          Vault JWT role name. Set to an empty string to skip Vault
+          entirely — useful for repos that don't need SMOKE_ORG_API_KEY
+          (e.g. pure-build-recipe repos that only typecheck/build).
+        type: string
+        default: ""
+      runtime:
+        description: Runtime to install — "bun" (default), "node", or "rust"
+        type: string
+        default: bun
+      install_command:
+        description: |
+          Command that installs dependencies. Bun/Node default is
+          something like `bun install --frozen-lockfile`. Rust callers
+          usually omit this (cargo fetches on build).
+        type: string
+        default: ""
+      smoke_commands:
+        description: |
+          Multi-line block of shell commands run in order under `set -e`.
+          Each line is a separate command — write what you'd run locally
+          to verify the PR is healthy. Example:
+            bun run typecheck
+            bun run lint
+            bun run build
+            bun test
+            bun run dist/index.js --version
+          Commands have access to all Vault secrets pulled below (via env),
+          plus SMOKE_ORG_API_KEY when vault_role is set.
+        type: string
+        required: true
+      extra_vault_secrets:
+        description: |
+          Additional secrets to pull from Vault beyond SMOKE_ORG_API_KEY,
+          one per line in hashicorp/vault-action format. Only used when
+          vault_role is non-empty.
+        type: string
+        default: ""
+      with_submodules:
+        description: |
+          Whether to check out git submodules recursively. Required for
+          repos that vendor sibling private repos (e.g. autopilot-mac
+          vendors runtools-agent-core). When true, pulls GH_PAT_RELEASES
+          from Vault and uses it to authenticate the submodule clone.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write   # Vault OIDC (only used when vault_role is set)
+  packages: read    # private @runtools-ai npm scope (db-schema, sdk, etc.)
+
+jobs:
+  smoke:
+    name: ${{ inputs.service_name }} PR smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Submodules handled below via Vault PAT (default GITHUB_TOKEN
+          # can't auth against sibling private repos).
+          submodules: false
+
+      - name: Install bun
+        if: inputs.runtime == 'bun'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Node
+        if: inputs.runtime == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Rust toolchain
+        if: inputs.runtime == 'rust'
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Pull smoke secrets from Vault
+        if: inputs.vault_role != ''
+        uses: hashicorp/vault-action@v3
+        with:
+          url: https://vault.runtools.ai
+          method: jwt
+          role: ${{ inputs.vault_role }}
+          jwtGithubAudience: https://github.com/runtools-ai
+          secrets: |
+            secret/data/shared SMOKE_ORG_API_KEY ;
+            ${{ inputs.with_submodules && 'secret/data/shared GH_PAT_RELEASES ;' || '' }}
+            ${{ inputs.extra_vault_secrets }}
+
+      - name: Check out private submodules
+        if: inputs.with_submodules
+        env:
+          GH_PAT: ${{ env.GH_PAT_RELEASES }}
+          GH_SUBMODULE_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_PAT" ]; then
+            echo "::error::GH_PAT_RELEASES from Vault is empty — submodule clone will fail"
+            exit 1
+          fi
+          if [ -z "$GH_SUBMODULE_USER" ]; then
+            GH_SUBMODULE_USER="git"
+          fi
+          git config --global url."https://${GH_SUBMODULE_USER}:${GH_PAT}@github.com/".insteadOf "https://github.com/"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Install dependencies
+        if: inputs.install_command != ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ${{ inputs.install_command }}
+
+      - name: Run smoke commands
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SMOKE_API_URL: https://api.runtools.ai
+          SMOKE_AUTH_URL: https://auth.runtools.ai
+          SMOKE_TOOLS_URL: https://tools.runtools.ai
+          SMOKE_BILLING_URL: https://billing.runtools.ai
+          SMOKE_STORAGE_URL: https://storage.runtools.ai
+        run: |
+          set -euo pipefail
+          # Each line of smoke_commands is run as a separate statement
+          # under set -e; any failure stops the job.
+          ${{ inputs.smoke_commands }}
