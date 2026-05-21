@@ -29,7 +29,8 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # required for Vault OIDC
+  id-token: write   # Vault OIDC
+  packages: read    # @runtools-ai npm scope on npm.pkg.github.com
 
 jobs:
   smoke:
@@ -44,6 +45,8 @@ jobs:
       smoke_script: scripts/smoke/pr-smoke.ts
       health_path: /health
 ```
+
+**Permissions note**: the caller MUST grant at least the same permissions the reusable workflow declares. GitHub fails the workflow with `startup_failure` if the caller is narrower than the reusable.
 
 Each repo declares its own probe set in `scripts/smoke/pr-smoke.ts` (or `.sh`).
 

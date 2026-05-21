@@ -16,6 +16,7 @@ on:
 permissions:
   contents: read
   id-token: write   # Vault OIDC
+  packages: read    # private @runtools-ai npm scope
 
 jobs:
   smoke:
