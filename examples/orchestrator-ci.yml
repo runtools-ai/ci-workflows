@@ -1,0 +1,41 @@
+---
+# Example caller workflow for runtools-orchestrator (droplet pattern).
+# Copy into runtools-orchestrator/.github/workflows/ci.yml.
+#
+# Calls runtools-ai/ci-workflows/.github/workflows/droplet-localhost-smoke.yml
+# pinned at @main (we'll pin to a SHA once the reusable is stable).
+
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+  id-token: write   # Vault OIDC
+
+jobs:
+  smoke:
+    uses: runtools-ai/ci-workflows/.github/workflows/droplet-localhost-smoke.yml@main
+    secrets: inherit
+    with:
+      service_name: orchestrator
+      vault_role: orchestrator
+      port: 8080
+      build_command: bun install --frozen-lockfile
+      start_command: bun run src/index.ts
+      smoke_script: scripts/smoke/pr-smoke.ts
+      health_path: /health
+      extra_vault_secrets: |
+        secret/data/shared MODEL_GATEWAY_INTERNAL_SECRET ;
+        secret/data/shared FC_SECRET ;
+        secret/data/shared CONVEX_AGENT_SECRET ;
+        secret/data/shared TOOLS_SERVICE_INTERNAL_SECRET ;
+        secret/data/shared BILLING_INTERNAL_SECRET ;
+        secret/data/shared STORAGE_INTERNAL_SECRET ;
+        secret/data/shared CREDENTIALS_ENCRYPTION_KEY ;
+        secret/data/shared OAUTH_STATE_JWT_SECRET ;
+        secret/data/shared SANDBOX_PROXY_JWT_SECRET

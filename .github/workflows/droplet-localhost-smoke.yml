@@ -1,0 +1,187 @@
+---
+# Reusable PR-gate workflow for RunTools droplet-pattern repos.
+#
+# Pattern: build PR code → start on localhost:<port> → run a focused smoke
+# script that hits localhost (the PR's code) for its own routes, and prod
+# (api.runtools.ai et al.) for cross-service dependencies. Authenticated
+# as the smoke-ci-only WorkOS org via SMOKE_ORG_API_KEY from Vault. The
+# org is capped at $1000 credit + no Stripe customer + no auto-topup, so
+# the worst case is a smoke run draining its own credits; nothing leaks
+# to real customers.
+#
+# Per-repo caller layout (.github/workflows/ci.yml):
+#
+#   jobs:
+#     smoke:
+#       uses: runtools-ai/ci-workflows/.github/workflows/droplet-localhost-smoke.yml@main
+#       secrets: inherit
+#       with:
+#         service_name: orchestrator
+#         vault_role: orchestrator
+#         port: 8080
+#         build_command: bun install --frozen-lockfile && bun run build
+#         start_command: bun run start
+#         smoke_script: scripts/smoke/pr-smoke.ts
+#         health_path: /health
+#         extra_vault_secrets: |
+#           secret/data/shared MODEL_GATEWAY_INTERNAL_SECRET
+#           secret/data/shared FC_SECRET
+
+name: Droplet localhost smoke
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: Short name of the service (used in logs)
+        type: string
+        required: true
+      vault_role:
+        description: Vault JWT role name (matches the repo's role binding)
+        type: string
+        required: true
+      port:
+        description: Port the service binds on localhost
+        type: number
+        required: true
+      build_command:
+        description: Shell command to install deps + build (bun/cargo/etc.)
+        type: string
+        required: true
+      start_command:
+        description: Shell command that starts the service in the foreground
+        type: string
+        required: true
+      smoke_script:
+        description: Path to the smoke script (e.g. scripts/smoke/pr-smoke.ts)
+        type: string
+        required: true
+      health_path:
+        description: HTTP path to poll for service readiness (default /health)
+        type: string
+        default: /health
+      health_timeout_seconds:
+        description: Max seconds to wait for /health to return 200 before failing
+        type: number
+        default: 60
+      runtime:
+        description: Runtime to install — "bun" (default), "node", or "rust"
+        type: string
+        default: bun
+      extra_vault_secrets:
+        description: |
+          Additional secrets to pull from Vault, one per line in
+          hashicorp/vault-action format (e.g. `secret/data/shared FC_SECRET`).
+          SMOKE_ORG_API_KEY + DATABASE_URL are pulled by default.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write   # Vault OIDC
+
+jobs:
+  smoke:
+    name: ${{ inputs.service_name }} PR smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bun
+        if: inputs.runtime == 'bun'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Node
+        if: inputs.runtime == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Rust toolchain
+        if: inputs.runtime == 'rust'
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Pull smoke secrets from Vault
+        uses: hashicorp/vault-action@v3
+        with:
+          url: https://vault.runtools.ai
+          method: jwt
+          role: ${{ inputs.vault_role }}
+          jwtGithubAudience: https://github.com/runtools-ai
+          secrets: |
+            secret/data/shared SMOKE_ORG_API_KEY ;
+            secret/data/shared DATABASE_URL ;
+            ${{ inputs.extra_vault_secrets }}
+
+      - name: Build PR code
+        run: ${{ inputs.build_command }}
+
+      - name: Start service on localhost:${{ inputs.port }} (background)
+        run: |
+          set -euo pipefail
+          # Run the start command in the background. nohup + & + disown so the
+          # subprocess survives this step and the cleanup step can kill it via
+          # the recorded PID.
+          nohup bash -c '${{ inputs.start_command }}' > /tmp/${{ inputs.service_name }}.log 2>&1 &
+          echo $! > /tmp/${{ inputs.service_name }}.pid
+          echo "Started ${{ inputs.service_name }} (pid=$(cat /tmp/${{ inputs.service_name }}.pid))"
+        env:
+          PORT: ${{ inputs.port }}
+          HOST: 127.0.0.1
+          # Common across droplet services. Repos that need more can put them in
+          # extra_vault_secrets above; they'll be available to the start command
+          # via the workflow env (vault-action exports them).
+          NODE_ENV: production
+
+      - name: Wait for ${{ inputs.health_path }} to return 200
+        run: |
+          set -euo pipefail
+          end=$(( $(date +%s) + ${{ inputs.health_timeout_seconds }} ))
+          while [ "$(date +%s)" -lt "$end" ]; do
+            if curl -fsS -o /dev/null "http://127.0.0.1:${{ inputs.port }}${{ inputs.health_path }}"; then
+              echo "✓ service healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::service ${{ inputs.service_name }} did not become healthy within ${{ inputs.health_timeout_seconds }}s"
+          echo "=== last 80 lines of service log ==="
+          tail -80 /tmp/${{ inputs.service_name }}.log || true
+          exit 1
+
+      - name: Run smoke script against localhost:${{ inputs.port }}
+        run: |
+          set -euo pipefail
+          # Smoke script: hits localhost (PR code) for its own routes + prod
+          # (api.runtools.ai, etc.) for cross-service deps. Org-scoped via
+          # SMOKE_ORG_API_KEY.
+          case "${{ inputs.runtime }}" in
+            bun)  bun run ${{ inputs.smoke_script }} ;;
+            node) node --experimental-strip-types ${{ inputs.smoke_script }} ;;
+            rust) bash ${{ inputs.smoke_script }} ;;
+            *)    bash ${{ inputs.smoke_script }} ;;
+          esac
+        env:
+          SMOKE_TARGET: http://127.0.0.1:${{ inputs.port }}
+          SMOKE_SERVICE: ${{ inputs.service_name }}
+
+      - name: Cleanup — kill service (always)
+        if: always()
+        run: |
+          if [ -f /tmp/${{ inputs.service_name }}.pid ]; then
+            pid=$(cat /tmp/${{ inputs.service_name }}.pid)
+            echo "Stopping ${{ inputs.service_name }} pid=$pid"
+            kill "$pid" 2>/dev/null || true
+            sleep 1
+            kill -9 "$pid" 2>/dev/null || true
+          fi
+          # Final tail in case the smoke script failed and we want diagnostics
+          if [ -f /tmp/${{ inputs.service_name }}.log ]; then
+            echo "=== last 40 lines of ${{ inputs.service_name }}.log ==="
+            tail -40 /tmp/${{ inputs.service_name }}.log || true
+          fi
