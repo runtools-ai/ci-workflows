@@ -75,6 +75,16 @@ on:
           SMOKE_ORG_API_KEY + DATABASE_URL are pulled by default.
         type: string
         default: ""
+      with_submodules:
+        description: |
+          Whether to check out git submodules recursively. Required for repos
+          that vendor sibling private repos (e.g. model-gateway vendors
+          `runtools-agent-core` under `vendor/`). When true, the workflow
+          pulls `GH_PAT_RELEASES` from Vault and uses it to authenticate the
+          submodule clone via a global `url.insteadOf` rewrite — same pattern
+          as the deploy workflows.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -88,6 +98,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          # We intentionally do NOT pass `submodules: true` here even when the
+          # caller requested submodules — the default Actions GITHUB_TOKEN
+          # can't auth against sibling private repos. Instead we pull
+          # GH_PAT_RELEASES from Vault below, set the url-rewrite, and run
+          # `git submodule update --init --recursive` manually.
+          submodules: false
 
       - name: Install bun
         if: inputs.runtime == 'bun'
@@ -117,7 +134,29 @@ jobs:
           secrets: |
             secret/data/shared SMOKE_ORG_API_KEY ;
             secret/data/shared DATABASE_URL ;
+            ${{ inputs.with_submodules && 'secret/data/shared GH_PAT_RELEASES ;' || '' }}
             ${{ inputs.extra_vault_secrets }}
+
+      - name: Check out private submodules
+        if: inputs.with_submodules
+        env:
+          GH_PAT: ${{ env.GH_PAT_RELEASES }}
+          GH_SUBMODULE_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_PAT" ]; then
+            echo "::error::GH_PAT_RELEASES from Vault is empty — submodule clone will fail"
+            exit 1
+          fi
+          if [ -z "$GH_SUBMODULE_USER" ]; then
+            GH_SUBMODULE_USER="git"
+          fi
+          # Same url-rewrite pattern as the per-repo deploy workflows. Scoped
+          # to this step's process via --global because git submodule shells
+          # out to a separate process that needs to inherit the auth.
+          git config --global url."https://${GH_SUBMODULE_USER}:${GH_PAT}@github.com/".insteadOf "https://github.com/"
+          git submodule sync --recursive
+          git submodule update --init --recursive
 
       - name: Build PR code
         env:
