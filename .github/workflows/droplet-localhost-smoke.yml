@@ -65,9 +65,17 @@ on:
         type: number
         default: 60
       runtime:
-        description: Runtime to install — "bun" (default), "node", or "rust"
+        description: Runtime to install for BUILDING the service — "bun" (default), "node", or "rust"
         type: string
         default: bun
+      smoke_runtime:
+        description: |
+          Runtime to use for the smoke script. Defaults to `runtime`. Set this
+          explicitly when the service is built with a different toolchain than
+          the smoke script — e.g. runtime=rust + smoke_runtime=bun for a Rust
+          service whose smoke script is bun-based TypeScript.
+        type: string
+        default: ""
       extra_vault_secrets:
         description: |
           Additional secrets to pull from Vault, one per line in
@@ -107,13 +115,13 @@ jobs:
           submodules: false
 
       - name: Install bun
-        if: inputs.runtime == 'bun'
+        if: inputs.runtime == 'bun' || inputs.smoke_runtime == 'bun'
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
       - name: Install Node
-        if: inputs.runtime == 'node'
+        if: inputs.runtime == 'node' || inputs.smoke_runtime == 'node'
         uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -207,7 +215,10 @@ jobs:
           # Smoke script: hits localhost (PR code) for its own routes + prod
           # (api.runtools.ai, etc.) for cross-service deps. Org-scoped via
           # SMOKE_ORG_API_KEY.
-          case "${{ inputs.runtime }}" in
+          # Dispatch on smoke_runtime if set, else fall back to runtime.
+          # This lets Rust services use a bun-based smoke script.
+          SMOKE_RT="${{ inputs.smoke_runtime != '' && inputs.smoke_runtime || inputs.runtime }}"
+          case "$SMOKE_RT" in
             bun)  bun run ${{ inputs.smoke_script }} ;;
             node) node --experimental-strip-types ${{ inputs.smoke_script }} ;;
             rust) bash ${{ inputs.smoke_script }} ;;
