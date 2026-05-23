@@ -1,0 +1,78 @@
+---
+# Example per-repo ci.yml for an App Platform repo (auth/billing/tools/runtools.ai).
+#
+# Two strategies depending on the repo's needs:
+#
+# STRATEGY A — build/typecheck/lint only (no preview app)
+# ─────────────────────────────────────────────────────────────────
+# Use this when you just need PR validation without a deployed preview.
+# Faster (~2 min vs ~10 min for preview deploy), no DO cost, no
+# secret-injection complexity. This is the right v1 for most App
+# Platform repos until the secret-injection pattern is figured out.
+#
+# jobs:
+#   smoke:
+#     uses: runtools-ai/ci-workflows/.github/workflows/consumer-prod-smoke.yml@main
+#     secrets: inherit
+#     with:
+#       service_name: billing
+#       vault_role: ""              # no secrets needed for typecheck/build
+#       runtime: bun
+#       install_command: bun install --frozen-lockfile
+#       smoke_commands: |
+#         bunx tsc --noEmit
+#         bun build src/index.ts --outdir dist --target bun
+#
+# STRATEGY B — deploy preview app + smoke against it
+# ─────────────────────────────────────────────────────────────────
+# Use this when you need to validate the PR's actual deployed behavior,
+# not just static correctness. Requires:
+#   - .do/app.yaml committed at repo root
+#   - The health_path returns 200 without decrypted secrets (or caller
+#     pre-populates preview secrets via doctl — see header of
+#     app-platform-preview-smoke.yml)
+#
+# jobs:
+#   preview-smoke:
+#     uses: runtools-ai/ci-workflows/.github/workflows/app-platform-preview-smoke.yml@main
+#     secrets: inherit
+#     with:
+#       service_name: tools
+#       vault_role: tools
+#       app_spec_path: .do/app.yaml
+#       health_path: /health
+#       smoke_commands: |
+#         curl -fsS "${SMOKE_TARGET_URL}/health"
+#         curl -fsS -H "Authorization: Bearer ${RUNTOOLS_API_KEY}" \
+#           "${SMOKE_TARGET_URL}/v1/marketplace"
+#
+# Most repos start with Strategy A and graduate to B once they have a
+# real preview-secrets story.
+
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [master, main]
+
+permissions:
+  contents: read
+  id-token: write       # Vault OIDC
+  pull-requests: write  # for digitalocean/app_action PR comments (Strategy B only)
+  packages: read        # private @runtools-ai npm scope
+
+jobs:
+  # Strategy A — build/typecheck/lint
+  smoke:
+    uses: runtools-ai/ci-workflows/.github/workflows/consumer-prod-smoke.yml@main
+    secrets: inherit
+    with:
+      service_name: example
+      vault_role: ""
+      runtime: bun
+      install_command: bun install --frozen-lockfile
+      smoke_commands: |
+        bunx tsc --noEmit
+        bun build src/index.ts --outdir dist --target bun

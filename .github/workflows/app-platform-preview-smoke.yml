@@ -1,0 +1,165 @@
+---
+# Reusable PR-gate workflow for RunTools App Platform repos.
+#
+# Pattern: PR opens → DO creates an ephemeral preview app from the PR's
+# branch → wait for preview to be healthy → run scoped smoke against the
+# preview URL with SMOKE_ORG_API_KEY → DO auto-destroys preview on PR
+# close/merge.
+#
+# This is the sibling of `droplet-localhost-smoke.yml` (orchestrator,
+# storage, model-gateway, fc-agent, code-exec) and `consumer-prod-smoke.yml`
+# (sdk, cli, autopilot-mac). It targets repos that deploy to DO App
+# Platform: `runtools-auth`, `runtools-billing`, `runtools-tools`,
+# `runtools.ai`.
+#
+# Required repo state:
+#   - `.do/app.yaml` committed at repo root with the App Platform spec.
+#     Pull initial spec from prod via: `doctl apps spec get <app-id> > .do/app.yaml`
+#   - DIGITALOCEAN_TOKEN available in Vault `secret/shared`
+#   - SMOKE_ORG_API_KEY in Vault `secret/shared`
+#
+# Sharp edge — secrets injection (CURRENT LIMITATION):
+#
+#   The committed `.do/app.yaml` contains `EV[1:...]` encrypted secret
+#   values from the PROD app's at-rest encryption key. When the action
+#   creates a fresh preview app, those values WILL NOT DECRYPT because
+#   the preview is a different app with its own encryption key.
+#
+#   For repos that need real backend functionality in the preview (DB
+#   access, auth, etc.), callers must override the secrets via
+#   `app_spec_overrides` input (NOT YET IMPLEMENTED — see RUN-XX) OR
+#   pre-populate the preview app's secrets via doctl before health check.
+#
+#   For repos whose smoke is purely health/route-shape (no DB writes,
+#   no auth-dependent paths), preview can boot in degraded mode where
+#   secret-dependent code paths return 500 but /health still returns
+#   200. Set `health_path` to a route that doesn't require secrets.
+#
+# Per-repo caller layout (.github/workflows/ci.yml):
+#
+#   jobs:
+#     smoke:
+#       uses: runtools-ai/ci-workflows/.github/workflows/app-platform-preview-smoke.yml@main
+#       secrets: inherit
+#       with:
+#         service_name: auth
+#         vault_role: runtools-auth
+#         app_spec_path: .do/app.yaml
+#         health_path: /health
+#         smoke_commands: |
+#           curl -fsS "${SMOKE_TARGET_URL}/health"
+#           curl -fsS "${SMOKE_TARGET_URL}/ready"
+
+name: App Platform preview smoke
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: Short name of the service (used in logs)
+        type: string
+        required: true
+      vault_role:
+        description: Vault JWT role name for this repo
+        type: string
+        required: true
+      app_spec_path:
+        description: Path to App Platform spec relative to repo root
+        type: string
+        default: .do/app.yaml
+      health_path:
+        description: |
+          HTTP path to poll for preview readiness. Must be a route that
+          works WITHOUT decrypted secrets (since EV[1:...] won't carry
+          over from prod's encryption key — see header for context).
+        type: string
+        default: /health
+      health_timeout_seconds:
+        description: Max seconds to wait for preview to become healthy
+        type: number
+        default: 600
+      smoke_commands:
+        description: |
+          Multi-line shell commands run after preview is healthy.
+          Available env: SMOKE_TARGET_URL, RUNTOOLS_API_KEY (=SMOKE_ORG_API_KEY),
+          plus any Vault secrets pulled via extra_vault_secrets.
+        type: string
+        required: true
+      extra_vault_secrets:
+        description: |
+          Extra Vault secrets to pull, one per line in
+          hashicorp/vault-action format. SMOKE_ORG_API_KEY + DIGITALOCEAN_TOKEN
+          are always pulled — don't list them here.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write       # Vault OIDC
+  pull-requests: write  # digitalocean/app_action posts PR comments with preview URL
+  packages: read        # private @runtools-ai npm scope
+
+jobs:
+  smoke:
+    name: ${{ inputs.service_name }} preview smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull secrets from Vault
+        uses: hashicorp/vault-action@v3
+        with:
+          url: https://vault.runtools.ai
+          method: jwt
+          role: ${{ inputs.vault_role }}
+          jwtGithubAudience: https://github.com/runtools-ai
+          secrets: |
+            secret/data/shared DIGITALOCEAN_TOKEN ;
+            secret/data/shared SMOKE_ORG_API_KEY ;
+            ${{ inputs.extra_vault_secrets }}
+
+      - name: Deploy PR preview app
+        id: deploy
+        uses: digitalocean/app_action/deploy@v2
+        with:
+          app_spec_location: ${{ inputs.app_spec_path }}
+          deploy_pr_preview: "true"
+          token: ${{ env.DIGITALOCEAN_TOKEN }}
+
+      - name: Wait for preview health
+        id: wait
+        env:
+          DEPLOY_OUTPUTS: ${{ toJson(steps.deploy.outputs) }}
+        run: |
+          set -euo pipefail
+          echo "deploy outputs: $DEPLOY_OUTPUTS"
+          PREVIEW_URL="${{ steps.deploy.outputs.app_url }}"
+          if [ -z "${PREVIEW_URL:-}" ]; then
+            echo "::error::digitalocean/app_action did not return app_url"
+            exit 1
+          fi
+          # Strip trailing slash to avoid double-slash in concat below
+          PREVIEW_URL="${PREVIEW_URL%/}"
+          echo "preview_url=$PREVIEW_URL" >> "$GITHUB_OUTPUT"
+          DEADLINE=$(( $(date +%s) + ${{ inputs.health_timeout_seconds }} ))
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            STATUS=$(curl -sS -o /dev/null -w "%{http_code}" "${PREVIEW_URL}${{ inputs.health_path }}" || echo 000)
+            if [ "$STATUS" = "200" ]; then
+              echo "Preview healthy: $PREVIEW_URL${{ inputs.health_path }} → 200"
+              exit 0
+            fi
+            echo "Waiting for $PREVIEW_URL${{ inputs.health_path }} (last: $STATUS)..."
+            sleep 15
+          done
+          echo "::error::Preview did not return 200 from ${{ inputs.health_path }} within ${{ inputs.health_timeout_seconds }}s"
+          exit 1
+
+      - name: Run smoke commands
+        env:
+          SMOKE_TARGET_URL: ${{ steps.wait.outputs.preview_url }}
+          RUNTOOLS_API_KEY: ${{ env.SMOKE_ORG_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ${{ inputs.smoke_commands }}
